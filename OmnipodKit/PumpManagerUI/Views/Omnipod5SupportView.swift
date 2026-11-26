@@ -10,13 +10,19 @@
 //  same App Attest download flow used by the pairing setup wizard.
 //
 //  The overflow ("…") menu offers "Load custom certificate" (only when no cert is
-//  loaded) and "Delete saved certificate" with a deletable (non compiled-in) cert.
+//  loaded), "Export certificate" (when one is loaded) and "Delete saved
+//  certificate" with a deletable (non compiled-in) cert.
+//
+//  Export writes a `.o5keypair` file, private key included, after a warning and
+//  device-owner authentication. The keychain copy is this-device-only, so an
+//  exported file is the only way to move the identity to a new phone.
 //
 //  Copyright © 2026 LoopKit Authors. All rights reserved.
 //
 
 import SwiftUI
 import UniformTypeIdentifiers
+import LocalAuthentication
 import LoopKit
 import LoopKitUI
 
@@ -43,11 +49,24 @@ struct Omnipod5SupportView: View {
     @State private var importError: String?
     @State private var pendingDelete = false
     @State private var pendingDeleteFinalConfirm = false
+    @State private var pendingExport = false
+    @State private var exportDocument: O5KeypairDocument?
+    @State private var exportFilename = ""
+    @State private var exportMessage: ExportMessage?
 
-    private var menuHasOptions: Bool {
-        if !certLoaded { return true }          // "Load custom certificate"
-        if deletableCert != nil { return true } // "Delete saved certificate"
-        return false
+    private struct ExportMessage: Identifiable {
+        let id = UUID()
+        let title: String
+        let text: String
+    }
+
+    /// Without a cert the menu offers "Load custom certificate"; with one it offers
+    /// "Export certificate". So there is always at least one option.
+    private var menuHasOptions: Bool { true }
+
+    /// The certificate in use for this pump manager if there is one, else any loaded one.
+    private var exportableCert: O5RegistrationData? {
+        O5RegistrationData.get(controllerId) ?? O5RegistrationData.allValues.first
     }
 
     var body: some View {
@@ -122,16 +141,45 @@ struct Omnipod5SupportView: View {
         }
     }
 
+    // The export modifiers live here rather than on the root view: SwiftUI drops one of
+    // two file presenters (the importer is on the root) attached to the same view, and
+    // export is only offered while a certificate is loaded, when this view is showing.
     @ViewBuilder
     private var loadedContent: some View {
         VStack(spacing: 16) {
             Image(systemName: "checkmark.circle.fill")
                 .font(.largeTitle)
                 .foregroundColor(.green)
+                // On its own view so it doesn't share a view with the warning alert below.
+                .alert(item: $exportMessage) { message in
+                    Alert(title: Text(message.title), message: Text(message.text))
+                }
             Text(loadedMessage)
                 .multilineTextAlignment(.center)
         }
         .padding(.horizontal)
+        .alert(
+            LocalizedString("Export Certificate?", comment: "Title of the O5 certificate export warning"),
+            isPresented: $pendingExport
+        ) {
+            Button(LocalizedString("Cancel", comment: "Cancel button"), role: .cancel) {}
+            Button(LocalizedString("Export", comment: "Confirm exporting the O5 certificate")) {
+                authenticateThenExport()
+            }
+        } message: {
+            Text(exportWarningMessage)
+        }
+        .fileExporter(
+            isPresented: Binding(
+                get: { exportDocument != nil },
+                set: { if !$0 { exportDocument = nil } }
+            ),
+            document: exportDocument,
+            contentType: .o5keypair,
+            defaultFilename: exportFilename
+        ) { result in
+            handleExportResult(result)
+        }
     }
 
     @ViewBuilder
@@ -160,6 +208,13 @@ struct Omnipod5SupportView: View {
                             showingFileImporter = true
                         } label: {
                             Label(LocalizedString("Load custom certificate", comment: "Menu action to import an o5keypair file"), systemImage: "square.and.arrow.down")
+                        }
+                    }
+                    if certLoaded {
+                        Button {
+                            pendingExport = true
+                        } label: {
+                            Label(LocalizedString("Export certificate", comment: "Menu action to export the O5 certificate as an o5keypair file"), systemImage: "square.and.arrow.up")
                         }
                     }
                     if O5RegistrationData.deletableCert != nil {
@@ -259,6 +314,11 @@ struct Omnipod5SupportView: View {
             comment: "Final confirmation message before deleting a saved O5 certificate")
     }
 
+    private var exportWarningMessage: String {
+        LocalizedString("The file contains this phone's Omnipod 5 private key. Anyone who has it can pair Omnipod 5 Pods as this phone.\n\nSave it somewhere private, such as a password manager, and don't share it. Use it only to load this certificate on a new phone.",
+            comment: "Warning shown before exporting the O5 certificate")
+    }
+
     private func sourceText(_ source: O5RegistrationSource) -> String {
         switch source {
         case .compiled:   return LocalizedString("Compiled", comment: "O5 cert source: compiled")
@@ -275,11 +335,16 @@ struct Omnipod5SupportView: View {
             let accessed = url.startAccessingSecurityScopedResource()
             defer { if accessed { url.stopAccessingSecurityScopedResource() } }
 
-            guard let data = try? Data(contentsOf: url),
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-                  let registrationData = O5RegistrationData.fromJSON(json)
-            else {
-                importError = LocalizedString("The selected file is not a valid o5keypair file.", comment: "Error when o5keypair file import fails")
+            let registrationData: O5RegistrationData
+            do {
+                guard let data = try? Data(contentsOf: url) else {
+                    throw O5KeypairFileError.malformed
+                }
+                // Checks that the keys and certificate belong together, so a bad
+                // file fails here rather than at the next pairing.
+                registrationData = try O5RegistrationData.fromKeypairFile(data)
+            } catch {
+                importError = error.localizedDescription
                 return
             }
             O5RegistrationData.install(registrationData, source: .imported)
@@ -290,6 +355,58 @@ struct Omnipod5SupportView: View {
             onCertStoreChanged()
         case .failure(let error):
             importError = error.localizedDescription
+        }
+    }
+
+    /// Export needs the phone's passcode or Face ID / Touch ID, like a bolus, since the
+    /// file carries the private key. Without a passcode set, export is refused.
+    private func authenticateThenExport() {
+        let context = LAContext()
+        var policyError: NSError?
+        guard context.canEvaluatePolicy(.deviceOwnerAuthentication, error: &policyError) else {
+            exportMessage = ExportMessage(
+                title: LocalizedString("Export Failed", comment: "Title of the O5 certificate export-failed alert"),
+                text: LocalizedString("Set a passcode on this phone to export the certificate.", comment: "O5 export refused because the phone has no passcode"))
+            return
+        }
+        context.evaluatePolicy(.deviceOwnerAuthentication,
+                               localizedReason: LocalizedString("Export the Omnipod 5 certificate", comment: "Reason shown with Face ID / passcode prompt for O5 certificate export")) { success, _ in
+            DispatchQueue.main.async {
+                if success {
+                    prepareExport()
+                }
+            }
+        }
+    }
+
+    private func prepareExport() {
+        guard let cert = exportableCert else { return }
+        do {
+            let data = try cert.keypairFileData()
+            exportFilename = cert.keypairFilename
+            exportDocument = O5KeypairDocument(data: data)
+        } catch {
+            exportMessage = ExportMessage(
+                title: LocalizedString("Export Failed", comment: "Title of the O5 certificate export-failed alert"),
+                text: error.localizedDescription)
+        }
+    }
+
+    private func handleExportResult(_ result: Result<URL, Error>) {
+        exportDocument = nil
+        switch result {
+        case .success:
+            exportMessage = ExportMessage(
+                title: LocalizedString("Certificate Exported", comment: "Title of the O5 certificate exported alert"),
+                text: LocalizedString("Keep this file private. To use it on a new phone, choose Load custom certificate on that phone's Omnipod 5 Support screen.",
+                    comment: "Message after the O5 certificate is exported"))
+        case .failure(let error):
+            if (error as? CocoaError)?.code == .userCancelled {
+                return
+            }
+            exportMessage = ExportMessage(
+                title: LocalizedString("Export Failed", comment: "Title of the O5 certificate export-failed alert"),
+                text: error.localizedDescription)
         }
     }
 
